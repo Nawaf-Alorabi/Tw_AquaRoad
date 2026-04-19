@@ -7,6 +7,8 @@ import datetime
 import time
 import urllib.parse
 import sqlite3
+import io
+from PIL import Image
 
 # --- 1. Page Configuration ---
 st.set_page_config(
@@ -36,6 +38,22 @@ st.markdown("""
         margin-bottom: 15px;
     }
     .details-text { color: #474747 !important; font-size: 13px; }
+
+    /* Dashboard button styling */
+    [data-testid="stSidebar"] a[data-testid="stPageLink-NavLink"] {
+        background-color: #ffffff !important;
+        color: #003527 !important;
+        border-radius: 8px !important;
+        padding: 10px 16px !important;
+        font-weight: bold !important;
+        display: block !important;
+        text-align: center !important;
+        text-decoration: none !important;
+        margin-top: 8px;
+    }
+    [data-testid="stSidebar"] a[data-testid="stPageLink-NavLink"]:hover {
+        background-color: #e0ede9 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -74,7 +92,6 @@ def send_telegram_alert(source_option, time_now):
 if 'last_alert_time' not in st.session_state:
     st.session_state.last_alert_time = 0
 
-# 
 if 'last_report_html' not in st.session_state:
     st.session_state.last_report_html = ""
 
@@ -93,37 +110,41 @@ st.divider()
 # --- 7. Sidebar ---
 with st.sidebar:
     st.markdown('<h3>⚙️ SETTINGS</h3>', unsafe_allow_html=True)
-    input_type = st.sidebar.radio("INPUT TYPE", ("Live Video", "Upload Image"))
-    source_option = st.sidebar.selectbox("CHOOSE SOURCE", ("Camera #402", "Camera #105", "Trial Stream"))
-    threshold = st.sidebar.slider("CONFIDENCE", 0.0, 1.0, 0.5)
-    iou_val = st.sidebar.slider("IoU THRESHOLD", 0.0, 1.0, 0.45)
+    source_option = st.selectbox("CHOOSE SOURCE", ("Camera #402", "Camera #105", "Trial Stream"))
+    threshold = st.slider("CONFIDENCE", 0.0, 1.0, 0.5)
+    iou_val = st.slider("IoU THRESHOLD", 0.0, 1.0, 0.45)
 
-# --- 8. Main Content ---
+    st.markdown("---")
+    st.markdown('<p style="color:white; font-size:13px; font-weight:bold;">📊 NAVIGATION</p>', unsafe_allow_html=True)
+
+    st.markdown("""
+        <a href="/Dashboard" target="_self" style="
+            display: block;
+            background-color: #ffffff;
+            color: #003527 !important;
+            text-align: center;
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 14px;
+            text-decoration: none;
+            margin-top: 4px;
+        ">📊 Go to Dashboard</a>
+    """, unsafe_allow_html=True)
+
+# --- 8. Main Content Layout ---
 col_video, col_info = st.columns([2, 1])
-
-with col_video:
-    if input_type == "Live Video":
-        st.markdown('<p style="font-weight:bold; color:#5E5E5E;">Live Monitoring Feed</p>', unsafe_allow_html=True)
-        st_frame = st.empty()
-    else:
-        st.markdown('<p style="font-weight:bold; color:#5E5E5E;">Image Analysis</p>', unsafe_allow_html=True)
-        uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
-        st_frame = st.empty()
 
 with col_info:
     st.markdown('<p style="font-weight:bold; color:#5E5E5E;">Control & Monitoring Panel</p>', unsafe_allow_html=True)
     status_indicator = st.empty()
-    
+
     if source_option == "Camera #402":
         location_name, coordinates = "Al-Hada District, Riyadh", "24.71°N, 46.67°E"
-        video_source = 0  # Local camera
     elif source_option == "Camera #105":
         location_name, coordinates = "Al-Malqa District, Riyadh", "24.82°N, 46.61°E"
-        video_source = 0  # Local camera
     else:
         location_name, coordinates = "Test Zone, Riyadh", "00.00°N, 00.00°E"
-        # Using a sample video URL for testing (you can replace with your own)
-        video_source = "https://commondatastorage.googleapis.com/gtv-videos-library/sample/ForBiggerBlazes.mp4"
 
     st.markdown(f"""
         <div class="metric-card">
@@ -132,21 +153,44 @@ with col_info:
             <div style="font-size: 11px; color: #474747;">{coordinates}</div>
         </div>
     """, unsafe_allow_html=True)
-    
+
     alert_log_placeholder = st.empty()
 
-def handle_detection(results, source_option):
+# --- 9. Camera Input ---
+with col_video:
+    st.markdown('<p style="font-weight:bold; color:#5E5E5E;">Live Monitoring Feed</p>', unsafe_allow_html=True)
+
+    camera_image = st.camera_input(
+        label="Capture frame for detection",
+        label_visibility="collapsed"
+    )
+
+    result_frame = st.empty()
+
+# --- 10. Run YOLO on each captured frame ---
+if camera_image is not None:
+    pil_img   = Image.open(io.BytesIO(camera_image.getvalue())).convert("RGB")
+    frame_rgb = np.array(pil_img)
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    results = model.predict(frame_bgr, conf=threshold, iou=iou_val)
+
     current_labels = [model.names[int(box.cls[0])].lower() for box in results[0].boxes]
     is_danger = any(label in current_labels for label in ["pond", "water", "flood", "puddle"])
+
+    annotated_rgb = cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB)
+    result_frame.image(annotated_rgb, caption="Detection Result", use_container_width=True)
 
     if is_danger:
         status_indicator.error("🚨 ALERT: Water Accumulation Detected")
         current_time = time.time()
+
         if current_time - st.session_state.last_alert_time > 600:
             time_now = datetime.datetime.now().strftime('%H:%M:%S')
             send_telegram_alert(source_option, time_now)
             save_report_to_db(source_option, "Detected")
             st.session_state.last_alert_time = current_time
+
             st.session_state.last_report_html = f"""
                 <div class="metric-card" style="border-left-color: #ba1a1a;">
                     <b style="color:#ba1a1a;">📅 Latest Archived Report:</b><br>
@@ -162,40 +206,5 @@ def handle_detection(results, source_option):
     if st.session_state.last_report_html:
         alert_log_placeholder.markdown(st.session_state.last_report_html, unsafe_allow_html=True)
 
-
-if input_type == "Live Video":
-    try:
-        cap = cv2.VideoCapture(video_source)
-        if not cap.isOpened():
-            st.error("❌ خطأ: لا يمكن الاتصال بمصدر الفيديو")
-            st.info("💡 للاستخدام المحلي: تأكد من توصيل الكاميرا")
-        else:
-            frame_count = 0
-            max_frames = 300
-            while cap.isOpened() and frame_count < max_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame = cv2.resize(frame, (640, 480))
-                results = model.predict(frame, conf=threshold, iou=iou_val)
-                st_frame.image(cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB), use_container_width=True)
-                handle_detection(results, source_option)
-                frame_count += 1
-            cap.release()
-            st.success(f"✅ تمت معالجة {frame_count} إطار")
-    except Exception as e:
-        st.error(f"❌ خطأ: {str(e)}")
-
-else:  # Upload Image
-    if uploaded_file is not None:
-        try:
-            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            image = cv2.imdecode(file_bytes, 1)
-            image = cv2.resize(image, (640, 480))
-            results = model.predict(image, conf=threshold, iou=iou_val)
-            st_frame.image(cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB), use_container_width=True)
-            handle_detection(results, source_option)
-        except Exception as e:
-            st.error(f"❌ خطأ في معالجة الصورة: {str(e)}")
-    else:
-        st.info("📤 يرجى رفع صورة للبدء في التحليل")
+else:
+    status_indicator.info("📷 Click the camera button to capture a frame and start detection.")
